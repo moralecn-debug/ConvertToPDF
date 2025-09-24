@@ -9,6 +9,7 @@ Dim  UserProfilePath, drvLtr, mapdrv, x, sPrompt, origin, ptype, ftype
 Dim  logfile, myfolder, item, targetfolder, tempfolder, fldr, newfile
 Dim  tag, synopsis, result, count, skip, batchsize, intermission, emsg, n
 Dim  cur, FileExtKey, WshShell ,Shell , FileExtStatus, objFSO
+Dim  backupfolder
 '
 '
  tempfolder = "\DESKTOP\CONVERSIONS\"   '(must start and end with a backslash)
@@ -25,13 +26,15 @@ UserProfilePath = objshell.ExpandEnvironmentStrings("%UserProfile%")
 '
 intermission = intermission * 1000
 tempfolder = UserProfilepath & tempfolder
-logfile = tempfolder&"Results.log"
+backupfolder = fso.BuildPath(tempfolder, "OriginalBackups")
+logfile = fso.BuildPath(tempfolder, "Results.log")
 cur = 0
 '
 '
 '===== CHECK SETTINGS BEFORE SELECTING FOLDER =====
 '
   CALL CHECKTEMP(tempfolder)
+  CALL ENSUREBACKUPFOLDER(tempfolder, backupfolder)
   CALL CHECKPRINTER(tempfolder)
 '
 '===== SHOW FILE EXTENSIONS ====
@@ -166,27 +169,40 @@ For each item in oshell.NameSpace(fldr).Items
         CALL MAKEPDF(item.path, ftype, tempfolder, myfolder, count, skip, batchsize)
    '
    elseif lcase(fso.GetExtensionName(item)) = lcase(ftype) then
+	Dim originalPath, originalStamp, originalSize, backupPath
+	Dim safeToCopy, conversionSuccessful
+	emsg = ""
+	originalPath = item.path
+	originalStamp = item.ModifyDate
+	originalSize = item.Size
+	backupPath = CreateSourceBackup(originalPath, backupfolder)
+	safeToCopy = (Len(backupPath) > 0)
+	conversionSuccessful = False
 	targetfolder = left(item.path, InStrRev(item.path, "\"))
 	newfile=fso.GetBaseName(item) &".pdf"
 	result = left(newfile, InStrRev(newfile, ".")-1) & tag & ".pdf"
 	'
 	if fso.FileExists(targetfolder&result) then
-		emsg = "PDF EXISTS:   " 
+		emsg = "PDF EXISTS:   "
 	else
-		'
-                item.InvokeVerbEx ( "Print" )         'create PDF file
-		'
-  	        'Rename new file to reduce chances of naming conflicts
-		n = 0   'Counter to avoid infinite loop if errors occur
-	 	Do until fso.FileExists(tempfolder&newfile)
-			n = n+1	        
-	       		WScript.Sleep(100) 'allow for network latency
-			if n > 80 then exit do  '(80x100 = 8 seconds)
-	        loop
-		'
-	        if fso.FileExists(tempfolder&newfile) then
-		   fso.movefile tempfolder&newfile, tempfolder&result
-		   WScript.Sleep(100) 'allow for network latency
+		if safeToCopy then
+			'
+			item.InvokeVerbEx ( "Print" )         'create PDF file
+			'
+			'Rename new file to reduce chances of naming conflicts
+			n = 0   'Counter to avoid infinite loop if errors occur
+			Do until fso.FileExists(tempfolder&newfile)
+				n = n+1
+				WScript.Sleep(100) 'allow for network latency
+				if n > 80 then exit do  '(80x100 = 8 seconds)
+			loop
+			'
+			if fso.FileExists(tempfolder&newfile) then
+			   fso.movefile tempfolder&newfile, tempfolder&result
+			   WScript.Sleep(100) 'allow for network latency
+			end if
+		else
+			emsg = "BACKUP FAILED:   "
 		end if
 		'
 	end if
@@ -194,23 +210,42 @@ For each item in oshell.NameSpace(fldr).Items
 	' Move new files to original folder (don't overwrite existing files)
 	' Files in read-only folders will be skipped
 	'
-	ON ERROR RESUME NEXT
-  	fso.CopyFile tempfolder&result, targetfolder
-	if err.number=0 then
+	if safeToCopy AND len(emsg) < 2 then
+		ON ERROR RESUME NEXT
+		fso.CopyFile tempfolder&result, targetfolder
+		if err.number=0 then
+			conversionSuccessful = True
+		else
+			emsg = "ERROR: >>>>>  "
+			err.clear
+		end if
+		ON ERROR goto 0
+	end if
+	'
+	if conversionSuccessful then
+		CALL ValidateOriginal(originalPath, originalStamp, originalSize, backupPath, emsg)
+	end if
+	'
+	if conversionSuccessful AND len(emsg) < 2 then
 		count=count+1
 		set objFile=fso.OpenTextFile(logfile,8,True)
 		objFile.Write vbCrLf & "Done          " & item.path
 		objFile.Close
 	else
 		skip=skip+1
-		if len(emsg) < 2 then emsg= "ERROR: >>>>>  "
+		if len(emsg) < 2 then
+			if safeToCopy then
+				emsg= "ERROR: >>>>>  "
+			else
+				emsg= "BACKUP FAILED:   "
+			end if
+		end if
 		'Add skipped file names to log file
 		set objFile=fso.OpenTextFile(logfile,8,True)
 		objFile.Write vbCrLf & emsg & item.path
 		objFile.Close
 		emsg=""
 	end if
-	ON ERROR goto 0
 	'
 	if fso.FileExists(tempfolder&result) then _
 		fso.DeleteFile(tempfolder&result)
@@ -218,11 +253,13 @@ For each item in oshell.NameSpace(fldr).Items
 	' Pause after each batch of files (variable 'batchsize') to allow
 	' Acrobat Distiller processes to catch up (avoids PC memory saturation)
 	'
-	if count mod batchsize = 0 AND count > 1 then _       
+	if count mod batchsize = 0 AND count > 1 then _
 		WScript.Sleep(intermission)    'batch size reached - pause
    end if
+		'
 '
    CALL CHECKTEMP(tempfolder)
+   CALL ENSUREBACKUPFOLDER(tempfolder, backupfolder)
 '
 Next
 '
@@ -253,6 +290,26 @@ SUB CHECKTEMP(tempfolder)
 END SUB
 '======================================
 '
+SUB ENSUREBACKUPFOLDER(tempfolder, backupfolder)
+
+   if fso.FolderExists(tempfolder) then
+        if fso.FolderExists(backupfolder) = false then
+                ON ERROR RESUME NEXT
+                fso.CreateFolder backupfolder
+                if err.number <> 0 then
+                        synopsis="Unable to create backup folder at:" &CHR(10)& backupfolder &CHR(10)& _
+                         "The script will exit to keep source documents safe."
+                        err.clear
+                        x=msgbox(synopsis,0,"Backup Folder Required")
+                        wscript.quit
+                end if
+                ON ERROR GOTO 0
+        end if
+   end if
+
+END SUB
+'======================================
+'
 SUB CHECKPRINTER(tempfolder)
 '
 ' Confirm that 'ADOBE PDF' is the default printer...
@@ -275,6 +332,155 @@ SUB CHECKPRINTER(tempfolder)
 '
 END SUB
 '
+'
+Function CreateSourceBackup(originalPath, backupfolder)
+
+    Dim backupPath
+    backupPath = ""
+
+    if len(originalPath) = 0 then
+        CreateSourceBackup = ""
+        Exit Function
+    end if
+
+    if fso.FileExists(originalPath) = false then
+        CreateSourceBackup = ""
+        Exit Function
+    end if
+
+    if fso.FolderExists(backupfolder) = false then
+        ON ERROR RESUME NEXT
+        fso.CreateFolder(backupfolder)
+        if err.number <> 0 then
+            err.clear
+            CreateSourceBackup = ""
+            ON ERROR GOTO 0
+            Exit Function
+        end if
+        ON ERROR GOTO 0
+    end if
+
+    backupPath = GetBackupPath(originalPath, backupfolder)
+
+    ON ERROR RESUME NEXT
+    fso.CopyFile originalPath, backupPath, False
+    if err.number <> 0 then
+        err.clear
+        backupPath = ""
+    end if
+    ON ERROR GOTO 0
+
+    CreateSourceBackup = backupPath
+
+End Function
+'
+'==========================================================================='
+'
+Function GetBackupPath(originalPath, backupfolder)
+
+    Dim baseName, extension, timestamp, candidate
+    baseName = fso.GetBaseName(originalPath)
+    extension = fso.GetExtensionName(originalPath)
+    timestamp = FormatTimestampForFileName(Now)
+    if len(extension) > 0 then
+        candidate = fso.BuildPath(backupfolder, baseName & "_" & timestamp & "." & extension)
+    else
+        candidate = fso.BuildPath(backupfolder, baseName & "_" & timestamp)
+    end if
+
+    Do While fso.FileExists(candidate)
+        Randomize
+        timestamp = timestamp & "_" & CStr(Int((1000) * Rnd))
+        if len(extension) > 0 then
+            candidate = fso.BuildPath(backupfolder, baseName & "_" & timestamp & "." & extension)
+        else
+            candidate = fso.BuildPath(backupfolder, baseName & "_" & timestamp)
+        end if
+    Loop
+
+    GetBackupPath = candidate
+
+End Function
+'
+'==========================================================================='
+'
+Function FormatTimestampForFileName(dt)
+
+    Dim formatted
+    formatted = CStr(dt)
+    formatted = Replace(formatted, ":", "-")
+    formatted = Replace(formatted, "/", "-")
+    formatted = Replace(formatted, " ", "_")
+    formatted = Replace(formatted, ",", "")
+    FormatTimestampForFileName = formatted
+
+End Function
+'
+'==========================================================================='
+'
+Sub ValidateOriginal(originalPath, originalStamp, originalSize, backupPath, emsg)
+
+    Dim fileInfo, sizeChanged, timeChanged
+
+    if len(emsg) > 0 then Exit Sub
+
+    if fso.FileExists(originalPath) = false then
+        if RestoreOriginalFromBackup(backupPath, originalPath) then
+            emsg = "SOURCE RESTORED: "
+        else
+            emsg = "SOURCE MISSING: "
+        end if
+        Exit Sub
+    end if
+
+    Set fileInfo = fso.GetFile(originalPath)
+    sizeChanged = False
+    timeChanged = False
+
+    ON ERROR RESUME NEXT
+    if CLng(originalSize) <> CLng(fileInfo.Size) then sizeChanged = True
+    if err.number <> 0 then
+        err.clear
+        sizeChanged = True
+    end if
+    if DateDiff("s", CDate(originalStamp), CDate(fileInfo.DateLastModified)) <> 0 then timeChanged = True
+    if err.number <> 0 then
+        err.clear
+        timeChanged = True
+    end if
+    ON ERROR GOTO 0
+
+    if sizeChanged OR timeChanged then
+        if RestoreOriginalFromBackup(backupPath, originalPath) then
+            emsg = "SOURCE RESTORED: "
+        else
+            emsg = "SOURCE MODIFIED: "
+        end if
+    end if
+
+End Sub
+'
+'==========================================================================='
+'
+Function RestoreOriginalFromBackup(backupPath, originalPath)
+
+    RestoreOriginalFromBackup = False
+
+    if len(backupPath) = 0 then Exit Function
+    if fso.FileExists(backupPath) = false then Exit Function
+
+    ON ERROR RESUME NEXT
+    fso.CopyFile backupPath, originalPath, True
+    if err.number = 0 then
+        RestoreOriginalFromBackup = True
+    else
+        err.clear
+    end if
+    ON ERROR GOTO 0
+
+End Function
+'
+'==========================================================================='
 '===========================================================================
 '
 SUB SHOWEXT(cur)
